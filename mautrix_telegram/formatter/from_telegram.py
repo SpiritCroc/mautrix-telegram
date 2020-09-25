@@ -239,9 +239,9 @@ def _telegram_entities_to_matrix(text: str, entities: List[TypeMessageEntity],
             skip_entity = _parse_url(html, entity_text,
                                      entity.url if entity_type == MessageEntityTextUrl else None)
         elif entity_type == MessageEntityBotCommand:
-            html.append(f"<font color='blue'>!{entity_text[1:]}</font>")
+            html.append(f"<font color='#2196F3'>!{entity_text[1:]}</font>")
         elif entity_type in (MessageEntityHashtag, MessageEntityCashtag, MessageEntityPhone):
-            html.append(f"<font color='blue'>{entity_text}</font>")
+            html.append(f"<font color='#2196F3'>{entity_text}</font>")
         else:
             skip_entity = True
         last_offset = relative_offset + (0 if skip_entity else entity.length)
