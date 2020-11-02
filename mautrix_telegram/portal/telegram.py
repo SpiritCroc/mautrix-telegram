@@ -99,8 +99,7 @@ class PortalTelegram(BasePortal, ABC):
                                                   encrypt=self.encrypted)
         if not file:
             return None
-        if self.get_config("inline_images") and (evt.message
-                                                 or evt.fwd_from or evt.reply_to_msg_id):
+        if self.get_config("inline_images") and (evt.message or evt.fwd_from or evt.reply_to):
             content = await formatter.telegram_to_matrix(
                 evt, source, self.main_intent,
                 prefix_html=f"<img src='{file.mxc}' alt='Inline Telegram photo'/><br/>",
@@ -439,12 +438,12 @@ class PortalTelegram(BasePortal, ABC):
             "max_file_size": min(config["bridge.max_document_size"], 2000) * 1024 * 1024
         }
 
-    async def backfill(self, source: 'AbstractUser', is_initial: bool = False,
+    async def backfill(self, source: 'u.User', is_initial: bool = False,
                        limit: Optional[int] = None, last_id: Optional[int] = None) -> None:
         async with self.backfill_method_lock:
             await self._locked_backfill(source, is_initial, limit, last_id)
 
-    async def _locked_backfill(self, source: 'AbstractUser', is_initial: bool = False,
+    async def _locked_backfill(self, source: 'u.User', is_initial: bool = False,
                                limit: Optional[int] = None, last_id: Optional[int] = None) -> None:
         limit = limit or (config["bridge.backfill.initial_limit"] if is_initial
                           else config["bridge.backfill.missed_limit"])
@@ -456,8 +455,11 @@ class PortalTelegram(BasePortal, ABC):
                                                else self.tgid))
         min_id = last.tgid if last else 0
         if last_id is None:
-            message = (await source.client.get_messages(self.peer, limit=1))[0]
-            last_id = message.id
+            messages = await source.client.get_messages(self.peer, limit=1)
+            if not messages:
+                # The chat seems empty
+                return
+            last_id = messages[0].id
         if last_id <= min_id:
             # Nothing to backfill
             return
@@ -481,7 +483,7 @@ class PortalTelegram(BasePortal, ABC):
         with self.backfill_lock:
             await self._backfill(source, min_id, limit)
 
-    async def _backfill(self, source: 'AbstractUser', min_id: Optional[int], limit: int) -> None:
+    async def _backfill(self, source: 'u.User', min_id: Optional[int], limit: int) -> None:
         self.backfill_leave = set()
         if ((self.peer_type == "user" and self.tgid != source.tgid
              and config["bridge.backfill.invite_own_puppet"])):
@@ -514,7 +516,8 @@ class PortalTelegram(BasePortal, ABC):
             self.log.debug(f"Iterating all messages starting with {min_id} (approx: {limit})")
             messages = client.iter_messages(entity, reverse=True, min_id=min_id)
             async for message in messages:
-                sender = p.Puppet.get(message.from_id) if message.from_id else None
+                sender = (p.Puppet.get(message.from_id.user_id)
+                          if isinstance(message.from_id, PeerUser) else None)
                 # TODO handle service messages?
                 await self.handle_telegram_message(source, sender, message)
                 count += 1
@@ -522,7 +525,8 @@ class PortalTelegram(BasePortal, ABC):
             self.log.debug(f"Fetching up to {limit} most recent messages")
             messages = await client.get_messages(entity, limit=limit)
             for message in reversed(messages):
-                sender = p.Puppet.get(message.from_id) if message.from_id else None
+                sender = (p.Puppet.get(TelegramID(message.from_id.user_id))
+                          if isinstance(message.from_id, PeerUser) else None)
                 await self.handle_telegram_message(source, sender, message)
                 count += 1
         return count
@@ -533,7 +537,7 @@ class PortalTelegram(BasePortal, ABC):
             self.log.trace("Got telegram message %d, but no room exists, creating...", evt.id)
             await self.create_matrix_room(source, invites=[source.mxid], update_if_exists=False)
 
-        if (self.peer_type == "user" and sender.tgid == self.tg_receiver
+        if (self.peer_type == "user" and sender and sender.tgid == self.tg_receiver
             and not sender.is_real_user and not await self.az.state_store.is_joined(self.mxid,
                                                                                     sender.mxid)):
             self.log.debug(f"Ignoring private chat message {evt.id}@{source.tgid} as receiver does"
