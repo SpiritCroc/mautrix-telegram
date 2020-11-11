@@ -13,7 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-from typing import Optional, Tuple, Coroutine
+from typing import Optional, Tuple, Awaitable
 import asyncio
 
 from telethon.tl.types import ChatForbidden, ChannelForbidden
@@ -105,18 +105,17 @@ async def bridge(evt: CommandEvent) -> EventID:
 
 
 async def cleanup_old_portal_while_bridging(evt: CommandEvent, portal: "po.Portal"
-                                            ) -> Tuple[
-    bool, Optional[Coroutine[None, None, None]]]:
+                                            ) -> Tuple[bool, Optional[Awaitable[None]]]:
     if not portal.mxid:
         await evt.reply("The portal seems to have lost its Matrix room between you"
                         "calling `$cmdprefix+sp bridge` and this command.\n\n"
                         "Continuing without touching previous Matrix room...")
         return True, None
     elif evt.args[0] == "delete-and-continue":
-        return True, portal.cleanup_portal("Portal deleted (moving to another room)")
+        return True, portal.cleanup_portal("Portal deleted (moving to another room)", delete=False)
     elif evt.args[0] == "unbridge-and-continue":
         return True, portal.cleanup_portal("Room unbridged (portal moving to another room)",
-                                           puppets_only=True)
+                                           puppets_only=True, delete=False)
     else:
         await evt.reply(
             "The chat you were trying to bridge already has a Matrix portal room.\n\n"
@@ -137,6 +136,9 @@ async def confirm_bridge(evt: CommandEvent) -> Optional[EventID]:
         return await evt.reply("Fatal error: tgid or peer_type missing from command_status. "
                                "This shouldn't happen unless you're messing with the command "
                                "handler code.")
+
+    is_logged_in = await evt.sender.is_logged_in() and not status["force_use_bot"]
+
     if "mxid" in status:
         ok, coro = await cleanup_old_portal_while_bridging(evt, portal)
         if not ok:
@@ -154,7 +156,13 @@ async def confirm_bridge(evt: CommandEvent) -> Optional[EventID]:
                                "`$cmdprefix+sp cancel` to cancel.")
 
     evt.sender.command_status = None
-    is_logged_in = await evt.sender.is_logged_in() and not status["force_use_bot"]
+    async with portal._room_create_lock:
+        await _locked_confirm_bridge(evt, portal=portal, room_id=bridge_to_mxid,
+                                     is_logged_in=is_logged_in)
+
+
+async def _locked_confirm_bridge(evt: CommandEvent, portal: 'po.Portal', room_id: RoomID,
+                                 is_logged_in: bool) -> Optional[EventID]:
     user = evt.sender if is_logged_in else evt.tgbot
     try:
         entity = await user.client.get_entity(portal.peer)
@@ -172,14 +180,14 @@ async def confirm_bridge(evt: CommandEvent) -> Optional[EventID]:
         else:
             return await evt.reply("The bot doesn't seem to be in that chat.")
 
-    direct = False
-
-    portal.mxid = bridge_to_mxid
-    portal.title, portal.about, levels = await get_initial_state(evt.az.intent, evt.room_id)
+    portal.mxid = room_id
+    portal.by_mxid[portal.mxid] = portal
+    (portal.title, portal.about, levels,
+     portal.encrypted) = await get_initial_state(evt.az.intent, evt.room_id)
     portal.photo_id = ""
     await portal.save()
 
-    asyncio.ensure_future(portal.update_matrix_room(user, entity, direct, levels=levels),
+    asyncio.ensure_future(portal.update_matrix_room(user, entity, direct=False, levels=levels),
                           loop=evt.loop)
 
     return await evt.reply("Bridging complete. Portal synchronization should begin momentarily.")

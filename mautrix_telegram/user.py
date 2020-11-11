@@ -48,7 +48,7 @@ config: Optional['Config'] = None
 SearchResult = NamedTuple('SearchResult', puppet='pu.Puppet', similarity=int)
 
 METRIC_LOGGED_IN = Gauge('bridge_logged_in', 'Users logged into bridge')
-METRIC_CONNECTED = Gauge('bridge_connected', 'Users connected')
+METRIC_CONNECTED = Gauge('bridge_connected', 'Users connected to Telegram')
 
 
 class User(AbstractUser, BaseUser):
@@ -201,16 +201,12 @@ class User(AbstractUser, BaseUser):
 
     async def start(self, delete_unless_authenticated: bool = False) -> 'User':
         await super().start()
-        self._track_metric(METRIC_CONNECTED, True)
         if await self.is_logged_in():
             self.log.debug(f"Ensuring post_login() for {self.name}")
             self.loop.create_task(self.post_login())
-            if config["metrics.enabled"]:
-                self._track_connection_task = self.loop.create_task(self._track_connection())
         elif delete_unless_authenticated:
             self.log.debug(f"Unauthenticated user {self.name} start()ed, deleting session...")
             await self.client.disconnect()
-            self._track_metric(METRIC_CONNECTED, False)
             self.client.session.delete()
         return self
 
@@ -230,6 +226,9 @@ class User(AbstractUser, BaseUser):
         self._track_metric(METRIC_CONNECTED, False)
 
     async def post_login(self, info: TLUser = None, first_login: bool = False) -> None:
+        if config["metrics.enabled"] and not self._track_connection_task:
+            self._track_connection_task = self.loop.create_task(self._track_connection())
+
         try:
             await self.update_info(info)
         except Exception:
@@ -305,11 +304,14 @@ class User(AbstractUser, BaseUser):
         for _, portal in self.portals.items():
             if not portal or portal.deleted or not portal.mxid or portal.has_bot:
                 continue
-            try:
-                await portal.main_intent.kick_user(portal.mxid, self.mxid,
-                                                   "Logged out of Telegram.")
-            except MatrixRequestError:
-                pass
+            if portal.peer_type == "user":
+                await portal.cleanup_portal("Logged out of Telegram")
+            else:
+                try:
+                    await portal.main_intent.kick_user(portal.mxid, self.mxid,
+                                                       "Logged out of Telegram.")
+                except MatrixRequestError:
+                    pass
         self.portals = {}
         self.contacts = []
         await self.save(portals=True, contacts=True)
@@ -324,6 +326,7 @@ class User(AbstractUser, BaseUser):
         if not ok:
             return False
         self.delete()
+        await self.stop()
         self._track_metric(METRIC_LOGGED_IN, False)
         return True
 
@@ -459,7 +462,8 @@ class User(AbstractUser, BaseUser):
     # region Class instance lookup
 
     @classmethod
-    def get_by_mxid(cls, mxid: UserID, create: bool = True) -> Optional['User']:
+    def get_by_mxid(cls, mxid: UserID, create: bool = True, check_db: bool = True
+                    ) -> Optional['User']:
         if not mxid:
             raise ValueError("Matrix ID can't be empty")
 
@@ -468,10 +472,11 @@ class User(AbstractUser, BaseUser):
         except KeyError:
             pass
 
-        user = DBUser.get_by_mxid(mxid)
-        if user:
-            user = cls.from_db(user)
-            return user
+        if check_db:
+            user = DBUser.get_by_mxid(mxid)
+            if user:
+                user = cls.from_db(user)
+                return user
 
         if create:
             user = cls(mxid)
