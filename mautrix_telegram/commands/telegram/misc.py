@@ -14,10 +14,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from typing import List, Optional, Tuple, cast
-import logging
 import codecs
 import base64
 import re
+
+from aiohttp import ClientSession, InvalidURL
 
 from telethon.errors import (InviteHashInvalidError, InviteHashExpiredError, OptionsTooMuchError,
                              UserAlreadyParticipantError, ChatIdInvalidError,
@@ -115,25 +116,25 @@ async def pm(evt: CommandEvent) -> EventID:
         return await evt.reply("That doesn't seem to be a user.")
     portal = po.Portal.get_by_entity(user, evt.sender.tgid)
     await portal.create_matrix_room(evt.sender, user, [evt.sender.mxid])
-    return await evt.reply("Created private chat room with "
-                           f"{pu.Puppet.get_displayname(user, False)}")
+    displayname, _ = pu.Puppet.get_displayname(user, False)
+    return await evt.reply(f"Created private chat room with {displayname}")
 
 
-async def _join(evt: CommandEvent, arg: str) -> Tuple[Optional[TypeUpdates], Optional[EventID]]:
-    if arg.startswith("joinchat/"):
-        invite_hash = arg[len("joinchat/"):]
+async def _join(evt: CommandEvent, identifier: str, link_type: str
+                ) -> Tuple[Optional[TypeUpdates], Optional[EventID]]:
+    if link_type == "joinchat":
         try:
-            await evt.sender.client(CheckChatInviteRequest(invite_hash))
+            await evt.sender.client(CheckChatInviteRequest(identifier))
         except InviteHashInvalidError:
             return None, await evt.reply("Invalid invite link.")
         except InviteHashExpiredError:
             return None, await evt.reply("Invite link expired.")
         try:
-            return (await evt.sender.client(ImportChatInviteRequest(invite_hash))), None
+            return (await evt.sender.client(ImportChatInviteRequest(identifier))), None
         except UserAlreadyParticipantError:
             return None, await evt.reply("You are already in that chat.")
     else:
-        channel = await evt.sender.client.get_entity(arg)
+        channel = await evt.sender.client.get_entity(identifier)
         if not channel:
             return None, await evt.reply("Channel/supergroup not found.")
         return await evt.sender.client(JoinChannelRequest(channel)), None
@@ -146,12 +147,26 @@ async def join(evt: CommandEvent) -> Optional[EventID]:
     if len(evt.args) == 0:
         return await evt.reply("**Usage:** `$cmdprefix+sp join <invite link>`")
 
-    regex = re.compile(r"(?:https?://)?t(?:elegram)?\.(?:dog|me)(?:joinchat/)?/(.+)")
-    arg = regex.match(evt.args[0])
+    url = evt.args[0]
+    if evt.config["bridge.invite_link_resolve"]:
+        try:
+            async with ClientSession() as sess, sess.get(url) as resp:
+                url = str(resp.url)
+        except InvalidURL:
+            return await evt.reply("That doesn't look like a Telegram invite link.")
+
+    regex = re.compile(r"(?:https?://)?t(?:elegram)?\.(?:dog|me)"
+                       r"(?:/(?P<type>joinchat|s))?/(?P<id>[^/]+)/?", flags=re.IGNORECASE)
+    arg = regex.match(url)
     if not arg:
         return await evt.reply("That doesn't look like a Telegram invite link.")
 
-    updates, _ = await _join(evt, arg.group(1))
+    data = arg.groupdict()
+    identifier = data["id"]
+    link_type = data["type"]
+    if link_type:
+        link_type = link_type.lower()
+    updates, _ = await _join(evt, identifier, link_type)
     if not updates:
         return None
 
@@ -165,9 +180,8 @@ async def join(evt: CommandEvent) -> Optional[EventID]:
             try:
                 await portal.create_matrix_room(evt.sender, chat, [evt.sender.mxid])
             except ChatIdInvalidError as e:
-                logging.getLogger("mau.commands").trace("ChatIdInvalidError while creating portal "
-                                                        "from !tg join command: %s",
-                                                        updates.stringify())
+                evt.log.trace("ChatIdInvalidError while creating portal from !tg join command: %s",
+                              updates.stringify())
                 raise e
             return await evt.reply(f"Created room for {portal.title}")
     return None

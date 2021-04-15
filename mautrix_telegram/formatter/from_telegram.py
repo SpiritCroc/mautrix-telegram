@@ -79,7 +79,7 @@ async def _add_forward_header(source: 'AbstractUser', content: TextMessageEventC
             try:
                 user = await source.client.get_entity(fwd_from.from_id)
                 if user:
-                    fwd_from_text = pu.Puppet.get_displayname(user, False)
+                    fwd_from_text, _ = pu.Puppet.get_displayname(user, False)
                     fwd_from_html = f"<b>{escape(fwd_from_text)}</b>"
             except (ValueError, RPCError):
                 fwd_from_text = fwd_from_html = "unknown user"
@@ -87,7 +87,7 @@ async def _add_forward_header(source: 'AbstractUser', content: TextMessageEventC
         from_id = (fwd_from.from_id.chat_id if isinstance(fwd_from.from_id, PeerChat)
                    else fwd_from.from_id.channel_id)
         portal = po.Portal.get_by_tgid(TelegramID(from_id))
-        if portal:
+        if portal and portal.title:
             fwd_from_text = portal.title
             if portal.alias:
                 fwd_from_html = (f"<a href='https://matrix.to/#/{portal.alias}'>"

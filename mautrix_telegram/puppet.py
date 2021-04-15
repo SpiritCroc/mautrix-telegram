@@ -13,7 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-from typing import Awaitable, Any, Dict, Iterable, Optional, Union, TYPE_CHECKING
+from typing import Awaitable, Any, Dict, Iterable, Optional, Union, Tuple, TYPE_CHECKING
 from difflib import SequenceMatcher
 import unicodedata
 import asyncio
@@ -24,10 +24,11 @@ from telethon.tl.types import (UserProfilePhoto, User, UpdateUserName, PeerUser,
 from yarl import URL
 
 from mautrix.appservice import AppService, IntentAPI
-from mautrix.errors import MatrixRequestError
+from mautrix.errors import MatrixRequestError, MatrixError
 from mautrix.bridge import BasePuppet
-from mautrix.types import UserID, SyncToken, RoomID
+from mautrix.types import UserID, SyncToken, RoomID, ContentURI
 from mautrix.util.simple_template import SimpleTemplate
+from mautrix.util.logging import TraceLogger
 
 from .types import TelegramID
 from .db import Puppet as DBPuppet
@@ -43,7 +44,7 @@ config: Optional['Config'] = None
 
 
 class Puppet(BasePuppet):
-    log: logging.Logger = logging.getLogger("mau.puppet")
+    log: TraceLogger = logging.getLogger("mau.puppet")
     az: AppService
     mx: 'MatrixHandler'
     loop: asyncio.AbstractEventLoop
@@ -64,6 +65,8 @@ class Puppet(BasePuppet):
     username: Optional[str]
     displayname: Optional[str]
     displayname_source: Optional[TelegramID]
+    displayname_contact: bool
+    displayname_quality: int
     photo_id: Optional[str]
     is_bot: bool
     is_registered: bool
@@ -85,6 +88,8 @@ class Puppet(BasePuppet):
                  username: Optional[str] = None,
                  displayname: Optional[str] = None,
                  displayname_source: Optional[TelegramID] = None,
+                 displayname_contact: bool = True,
+                 displayname_quality: int = 0,
                  photo_id: Optional[str] = None,
                  is_bot: bool = False,
                  is_registered: bool = False,
@@ -100,6 +105,8 @@ class Puppet(BasePuppet):
         self.username = username
         self.displayname = displayname
         self.displayname_source = displayname_source
+        self.displayname_contact = displayname_contact
+        self.displayname_quality = displayname_quality
         self.photo_id = photo_id
         self.is_bot = is_bot
         self.is_registered = is_registered
@@ -164,8 +171,10 @@ class Puppet(BasePuppet):
         return dict(access_token=self.access_token, next_batch=self._next_batch,
                     custom_mxid=self.custom_mxid, username=self.username, is_bot=self.is_bot,
                     displayname=self.displayname, displayname_source=self.displayname_source,
-                    photo_id=self.photo_id, matrix_registered=self.is_registered,
-                    disable_updates=self.disable_updates, base_url=self.base_url)
+                    displayname_contact=self.displayname_contact,
+                    displayname_quality=self.displayname_quality, photo_id=self.photo_id,
+                    matrix_registered=self.is_registered, disable_updates=self.disable_updates,
+                    base_url=str(self.base_url) if self.base_url else None)
 
     def new_db_instance(self) -> DBPuppet:
         return DBPuppet(id=self.id, **self._fields)
@@ -177,9 +186,10 @@ class Puppet(BasePuppet):
     def from_db(cls, db_puppet: DBPuppet) -> 'Puppet':
         return Puppet(db_puppet.id, db_puppet.access_token, db_puppet.custom_mxid,
                       db_puppet.next_batch, db_puppet.base_url, db_puppet.username,
-                      db_puppet.displayname, db_puppet.displayname_source, db_puppet.photo_id,
-                      db_puppet.is_bot, db_puppet.matrix_registered, db_puppet.disable_updates,
-                      db_instance=db_puppet)
+                      db_puppet.displayname, db_puppet.displayname_source,
+                      db_puppet.displayname_contact, db_puppet.displayname_quality,
+                      db_puppet.photo_id, db_puppet.is_bot, db_puppet.matrix_registered,
+                      db_puppet.disable_updates, db_instance=db_puppet)
 
     # endregion
     # region Info updating
@@ -203,7 +213,7 @@ class Puppet(BasePuppet):
         return name
 
     @classmethod
-    def get_displayname(cls, info: User, enable_format: bool = True) -> str:
+    def get_displayname(cls, info: User, enable_format: bool = True) -> Tuple[str, int]:
         fn = cls._filter_name(info.first_name)
         ln = cls._filter_name(info.last_name)
         data = {
@@ -216,19 +226,21 @@ class Puppet(BasePuppet):
         }
         preferences = config["bridge.displayname_preference"]
         name = None
+        quality = 99
         for preference in preferences:
             name = data[preference]
             if name:
                 break
+            quality -= 1
 
         if isinstance(info, User) and info.deleted:
             name = f"Deleted account {info.id}"
+            quality = 99
         elif not name:
             name = str(info.id)
+            quality = 0
 
-        if not enable_format:
-            return name
-        return cls.displayname_template.format_full(name)
+        return (cls.displayname_template.format_full(name) if enable_format else name), quality
 
     async def try_update_info(self, source: 'AbstractUser', info: User) -> None:
         try:
@@ -264,27 +276,40 @@ class Puppet(BasePuppet):
             allow_because = "user is the primary source"
         elif not isinstance(info, UpdateUserName) and not info.contact:
             allow_because = "user is not a contact"
-        elif self.displayname_source is None:
+        elif not self.displayname_source:
             allow_because = "no primary source set"
+        elif not self.displayname:
+            allow_because = "user has no name"
         else:
             return False
 
         if isinstance(info, UpdateUserName):
             info = await source.client.get_entity(PeerUser(self.tgid))
+        if not info.contact:
+            self.displayname_contact = False
+        elif not self.displayname_contact:
+            if not self.displayname:
+                self.displayname_contact = True
+            else:
+                return False
 
-        displayname = self.get_displayname(info)
-        if displayname != self.displayname:
+        displayname, quality = self.get_displayname(info)
+        if displayname != self.displayname and quality >= self.displayname_quality:
+            allow_because = f"{allow_because} and quality {quality} >= {self.displayname_quality}"
             self.log.debug(f"Updating displayname of {self.id} (src: {source.tgid}, allowed "
                            f"because {allow_because}) from {self.displayname} to {displayname}")
+            self.log.trace("Displayname source data: %s", info)
             self.displayname = displayname
             self.displayname_source = source.tgid
+            self.displayname_quality = quality
             try:
                 await self.default_mxid_intent.set_displayname(
                     displayname[:config["bridge.displayname_max_length"]])
-            except MatrixRequestError:
+            except MatrixError:
                 self.log.exception("Failed to set displayname")
                 self.displayname = ""
                 self.displayname_source = None
+                self.displayname_quality = 0
             return True
         elif source.is_relaybot or self.displayname_source is None:
             self.displayname_source = source.tgid
@@ -309,8 +334,8 @@ class Puppet(BasePuppet):
             if not photo_id:
                 self.photo_id = ""
                 try:
-                    await self.default_mxid_intent.set_avatar_url("")
-                except MatrixRequestError:
+                    await self.default_mxid_intent.set_avatar_url(ContentURI(""))
+                except MatrixError:
                     self.log.exception("Failed to set avatar")
                     self.photo_id = ""
                 return True
@@ -326,13 +351,13 @@ class Puppet(BasePuppet):
                 self.photo_id = photo_id
                 try:
                     await self.default_mxid_intent.set_avatar_url(file.mxc)
-                except MatrixRequestError:
+                except MatrixError:
                     self.log.exception("Failed to set avatar")
                     self.photo_id = ""
                 return True
         return False
 
-    def default_puppet_should_leave_room(self, room_id: RoomID) -> bool:
+    async def default_puppet_should_leave_room(self, room_id: RoomID) -> bool:
         portal: p.Portal = p.Portal.get_by_mxid(room_id)
         return portal and not portal.backfill_lock.locked and portal.peer_type != "user"
 

@@ -34,7 +34,7 @@ from telethon.tl.types import (
     MessageMediaPhoto, MessageMediaDice, MessageMediaGame, MessageMediaUnsupported, PeerUser,
     PhotoCachedSize, TypeChannelParticipant, TypeChatParticipant, TypeDocumentAttribute,
     TypeMessageAction, TypePhotoSize, PhotoSize, UpdateChatUserTyping, UpdateUserTyping,
-    MessageEntityPre, ChatPhotoEmpty)
+    MessageEntityPre, ChatPhotoEmpty, DocumentAttributeImageSize)
 
 from mautrix.appservice import IntentAPI
 from mautrix.types import (EventID, UserID, ImageInfo, ThumbnailInfo, RelatesTo, MessageType,
@@ -109,8 +109,7 @@ class PortalTelegram(BasePortal, ABC):
             return await self._send_message(intent, content, timestamp=evt.date)
         info = ImageInfo(
             height=largest_size.h, width=largest_size.w, orientation=0, mimetype=file.mime_type,
-            size=(len(largest_size.bytes) if (isinstance(largest_size, PhotoCachedSize))
-                  else largest_size.size))
+            size=self._photo_size_key(largest_size))
         ext = sane_mimetypes.guess_extension(file.mime_type)
         name = f"disappearing_image{ext}" if media.ttl_seconds else f"image{ext}"
         await intent.set_typing(self.mxid, is_typing=False)
@@ -143,6 +142,8 @@ class PortalTelegram(BasePortal, ABC):
                 is_sticker = True
                 sticker_alt = attr.alt
             elif isinstance(attr, DocumentAttributeVideo):
+                width, height = attr.w, attr.h
+            elif isinstance(attr, DocumentAttributeImageSize):
                 width, height = attr.w, attr.h
         return DocAttrs(name, mime_type, is_sticker, sticker_alt, width, height)
 
@@ -185,7 +186,7 @@ class PortalTelegram(BasePortal, ABC):
                                                 width=file.thumbnail.width or thumb_size.w,
                                                 size=file.thumbnail.size)
         else:
-            # This is a hack for bad clients like Riot iOS that require a thumbnail
+            # This is a hack for bad clients like Element iOS that require a thumbnail
             if file.decryption_info:
                 info.thumbnail_file = file.decryption_info
             else:
@@ -226,9 +227,21 @@ class PortalTelegram(BasePortal, ABC):
         await intent.set_typing(self.mxid, is_typing=False)
 
         event_type = EventType.ROOM_MESSAGE
-        # Riot only supports images as stickers, so send animated webm stickers as m.video
+        # Elements only support images as stickers, so send animated webm stickers as m.video
         if attrs.is_sticker and file.mime_type.startswith("image/"):
             event_type = EventType.STICKER
+            # Tell clients to render the stickers as 256x256 if they're bigger
+            if info.width > 256 or info.height > 256:
+                if info.width > info.height:
+                    info.height = int(info.height / (info.width / 256))
+                    info.width = 256
+                else:
+                    info.width = int(info.width / (info.height / 256))
+                    info.height = 256
+            if info.thumbnail_info:
+                info.thumbnail_info.width = info.width
+                info.thumbnail_info.height = info.height
+
         content = MediaMessageEventContent(
             body=name or "unnamed file", info=info, relates_to=relates_to,
             external_url=self._get_external_url(evt),
@@ -318,16 +331,63 @@ class PortalTelegram(BasePortal, ABC):
         await intent.set_typing(self.mxid, is_typing=False)
         return await self._send_message(intent, content, timestamp=evt.date)
 
+    @staticmethod
+    def _format_dice(roll: MessageMediaDice) -> str:
+        if roll.emoticon == "\U0001F3B0":
+            emojis = {
+                0: "\U0001F36B",  # "🍫",
+                1: "\U0001F352",  # "🍒",
+                2: "\U0001F34B",  # "🍋",
+                3: "7\ufe0f\u20e3"  # "7️⃣",
+            }
+            res = roll.value - 1
+            slot1, slot2, slot3 = emojis[res % 4], emojis[res // 4 % 4], emojis[res // 16]
+            return f"{slot1} {slot2} {slot3} ({roll.value})"
+        elif roll.emoticon == "\u26BD":
+            results = {
+                1: "miss",
+                2: "hit the woodwork",
+                3: "goal",  # seems to go in through the center
+                4: "goal",
+                5: "goal 🎉",  # seems to go in through the top right corner, includes confetti
+            }
+        elif roll.emoticon == "\U0001F3B3":
+            results = {
+                1: "miss",
+                2: "1 pin down",
+                3: "3 pins down, split",
+                4: "4 pins down, split",
+                5: "5 pins down",
+                6: "strike 🎉",
+            }
+        # elif roll.emoticon == "\U0001F3C0":
+        #     results = {
+        #         2: "rolled off",
+        #         3: "stuck",
+        #     }
+        # elif roll.emoticon == "\U0001F3AF":
+        #     results = {
+        #         1: "bounced off",
+        #         2: "outer rim",
+        #
+        #         6: "bullseye",
+        #     }
+        else:
+            return str(roll.value)
+        return f"{results[roll.value]} ({roll.value})"
+
     async def handle_telegram_dice(self, source: 'AbstractUser', intent: IntentAPI, evt: Message,
                                    relates_to: RelatesTo) -> EventID:
         emoji_text = {
             "\U0001F3AF": " Dart throw",
             "\U0001F3B2": " Dice roll",
             "\U0001F3C0": " Basketball throw",
+            "\U0001F3B0": " Slot machine",
+            "\U0001F3B3": " Bowling",
             "\u26BD": " Football kick"
         }
         roll: MessageMediaDice = evt.media
-        text = f"{roll.emoticon}{emoji_text.get(roll.emoticon, '')} result: {roll.value}"
+        text = f"{roll.emoticon}{emoji_text.get(roll.emoticon, '')} result: {self._format_dice(roll)}"
         content = TextMessageEventContent(msgtype=MessageType.TEXT, format=Format.HTML, body=text,
                                           formatted_body=f"<h4>{text}</h4>", relates_to=relates_to,
                                           external_url=self._get_external_url(evt))
@@ -575,6 +635,9 @@ class PortalTelegram(BasePortal, ABC):
                            "displayname, updating info...")
             entity = await source.client.get_entity(PeerUser(sender.tgid))
             await sender.update_info(source, entity)
+            if not sender.displayname:
+                self.log.debug(f"Telegram user {sender.tgid} doesn't have a displayname even after"
+                               f" updating with data {entity!s}")
 
         allowed_media = (MessageMediaPhoto, MessageMediaDocument, MessageMediaGeo,
                          MessageMediaGame, MessageMediaDice, MessageMediaPoll,
@@ -694,13 +757,20 @@ class PortalTelegram(BasePortal, ABC):
             levels.users[puppet.mxid] = 50
         await self.main_intent.set_power_levels(self.mxid, levels)
 
-    async def receive_telegram_pin_id(self, msg_id: TelegramID, receiver: TelegramID) -> None:
-        tg_space = receiver if self.peer_type != "channel" else self.tgid
-        message = DBMessage.get_one_by_tgid(msg_id, tg_space) if msg_id != 0 else None
-        if message:
-            await self.main_intent.set_pinned_messages(self.mxid, [message.mxid])
-        else:
-            await self.main_intent.set_pinned_messages(self.mxid, [])
+    async def receive_telegram_pin_ids(self, msg_ids: List[TelegramID], receiver: TelegramID,
+                                       remove: bool) -> None:
+        async with self._pin_lock:
+            tg_space = receiver if self.peer_type != "channel" else self.tgid
+            previously_pinned = await self.main_intent.get_pinned_messages(self.mxid)
+            currently_pinned_dict = {event_id: True for event_id in previously_pinned}
+            for message in DBMessage.get_first_by_tgids(msg_ids, tg_space):
+                if remove:
+                    currently_pinned_dict.pop(message.mxid, None)
+                else:
+                    currently_pinned_dict[message.mxid] = True
+            currently_pinned = list(currently_pinned_dict.keys())
+            if currently_pinned != previously_pinned:
+                await self.main_intent.set_pinned_messages(self.mxid, currently_pinned)
 
     async def set_telegram_admins_enabled(self, enabled: bool) -> None:
         level = 50 if enabled else 10

@@ -22,11 +22,10 @@ import magic
 
 from telethon.tl.functions.messages import (EditChatPhotoRequest, EditChatTitleRequest,
                                             UpdatePinnedMessageRequest, SetTypingRequest,
-                                            EditChatAboutRequest)
+                                            EditChatAboutRequest, UnpinAllMessagesRequest)
 from telethon.tl.functions.channels import EditPhotoRequest, EditTitleRequest, JoinChannelRequest
-from telethon.errors import (ChatNotModifiedError, PhotoExtInvalidError,
-                             PhotoInvalidDimensionsError, PhotoSaveFileInvalidError,
-                             RPCError)
+from telethon.errors import (ChatNotModifiedError, PhotoExtInvalidError, MessageIdInvalidError,
+                             PhotoInvalidDimensionsError, PhotoSaveFileInvalidError, RPCError)
 from telethon.tl.patched import Message, MessageService
 from telethon.tl.types import (DocumentAttributeFilename, DocumentAttributeImageSize, GeoPoint,
                                InputChatUploadedPhoto, MessageActionChatEditPhoto, MessageMediaGeo,
@@ -113,7 +112,19 @@ class PortalMatrix(BasePortal, ABC):
         space = self.tgid if self.peer_type == "channel" else user.tgid
         message = DBMessage.get_by_mxid(event_id, self.mxid, space)
         if not message:
-            return
+            message = DBMessage.find_last(self.mxid, space)
+            if not message:
+                self.log.debug(f"Dropping Matrix read receipt from {user.mxid}: "
+                               f"target message {event_id} not known and last message"
+                               " in chat not found")
+                return
+            else:
+                self.log.debug(f"Matrix read receipt target {event_id} not known, marking "
+                               f"messages up to most recent ({message.mxid}/{message.tgid}) "
+                               f"as read by {user.mxid}/{user.tgid}")
+        else:
+            self.log.debug("Handling Matrix read receipt: marking messages up to "
+                           f"{message.mxid}/{message.tgid} as read by {user.mxid}/{user.tgid}")
         await user.client.send_read_acknowledge(self.peer, max_id=message.tgid,
                                                 clear_mentions=True)
 
@@ -327,7 +338,7 @@ class PortalMatrix(BasePortal, ABC):
             self.log.exception("Failed to parse location")
             return None
         caption, entities = await formatter.matrix_to_telegram(client, text=content.body)
-        media = MessageMediaGeo(geo=GeoPoint(lat, long, access_hash=0))
+        media = MessageMediaGeo(geo=GeoPoint(lat=lat, long=long, access_hash=0))
 
         async with self.send_lock(sender_id):
             if await self._matrix_document_edit(client, content, space, caption, media, event_id):
@@ -412,23 +423,23 @@ class PortalMatrix(BasePortal, ABC):
         else:
             self.log.trace("Unhandled Matrix event: %s", content)
 
-    async def handle_matrix_pin(self, sender: 'u.User', pinned_message: Optional[EventID],
+    async def handle_matrix_unpin_all(self, sender: 'u.User', pin_event_id: EventID) -> None:
+        await sender.client(UnpinAllMessagesRequest(peer=self.peer))
+        await self._send_delivery_receipt(pin_event_id)
+
+    async def handle_matrix_pin(self, sender: 'u.User', changes: Dict[EventID, bool],
                                 pin_event_id: EventID) -> None:
-        if self.peer_type != "chat" and self.peer_type != "channel":
-            return
-        try:
-            if not pinned_message:
-                await sender.client(UpdatePinnedMessageRequest(peer=self.peer, id=0))
-            else:
-                tg_space = self.tgid if self.peer_type == "channel" else sender.tgid
-                message = DBMessage.get_by_mxid(pinned_message, self.mxid, tg_space)
-                if message is None:
-                    self.log.warning(f"Could not find pinned {pinned_message} in {self.mxid}")
-                    return
-                await sender.client(UpdatePinnedMessageRequest(peer=self.peer, id=message.tgid))
-            await self._send_delivery_receipt(pin_event_id)
-        except ChatNotModifiedError:
-            pass
+        tg_space = self.tgid if self.peer_type == "channel" else sender.tgid
+        ids = {msg.mxid: msg.tgid
+               for msg in DBMessage.get_by_mxids(list(changes.keys()),
+                                                 mx_room=self.mxid, tg_space=tg_space)}
+        for event_id, pinned in changes.items():
+            try:
+                await sender.client(UpdatePinnedMessageRequest(peer=self.peer, id=ids[event_id],
+                                                               unpin=not pinned))
+            except (ChatNotModifiedError, MessageIdInvalidError, KeyError):
+                pass
+        await self._send_delivery_receipt(pin_event_id)
 
     async def handle_matrix_deletion(self, deleter: 'u.User', event_id: EventID,
                                      redaction_event_id: EventID) -> None:
@@ -436,12 +447,18 @@ class PortalMatrix(BasePortal, ABC):
         space = self.tgid if self.peer_type == "channel" else real_deleter.tgid
         message = DBMessage.get_by_mxid(event_id, self.mxid, space)
         if not message:
-            return
-        if message.edit_index == 0:
+            self.log.trace(f"Ignoring Matrix redaction of unknown event {event_id}")
+        elif message.redacted:
+            self.log.debug("Ignoring Matrix redaction of already redacted event "
+                           f"{message.mxid} in {message.mx_room}")
+        elif message.edit_index != 0:
+            message.edit(redacted=True)
+            self.log.debug("Ignoring Matrix redaction of edit event "
+                           f"{message.mxid} in {message.mx_room}")
+        else:
+            message.edit(redacted=True)
             await real_deleter.client.delete_messages(self.peer, [message.tgid])
             await self._send_delivery_receipt(redaction_event_id)
-        else:
-            self.log.debug(f"Ignoring deletion of edit event {message.mxid} in {message.mx_room}")
 
     async def _update_telegram_power_level(self, sender: 'u.User', user_id: TelegramID,
                                            level: int) -> None:
