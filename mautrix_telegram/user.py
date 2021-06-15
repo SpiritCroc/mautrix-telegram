@@ -1,5 +1,5 @@
 # mautrix-telegram - A Matrix-Telegram puppeting bridge
-# Copyright (C) 2020 Tulir Asokan
+# Copyright (C) 2021 Tulir Asokan
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as published by
@@ -15,22 +15,23 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from typing import (Awaitable, Dict, List, Iterable, NamedTuple, Optional, Tuple, Any, cast,
                     TYPE_CHECKING)
-from collections import defaultdict
+from datetime import datetime, timezone
 import logging
 import asyncio
 
 from telethon.tl.types import (TypeUpdate, UpdateNewMessage, UpdateNewChannelMessage,
                                UpdateShortChatMessage, UpdateShortMessage, User as TLUser, Chat,
-                               ChatForbidden)
+                               ChatForbidden, UpdateFolderPeers, UpdatePinnedDialogs,
+                               UpdateNotifySettings, NotifyPeer)
 from telethon.tl.custom import Dialog
 from telethon.tl.types.contacts import ContactsNotModified
 from telethon.tl.functions.contacts import GetContactsRequest, SearchRequest
 from telethon.tl.functions.account import UpdateStatusRequest
 
 from mautrix.client import Client
-from mautrix.errors import MatrixRequestError
-from mautrix.types import UserID, RoomID
-from mautrix.bridge import BaseUser
+from mautrix.errors import MatrixRequestError, MNotFound
+from mautrix.types import UserID, RoomID, PushRuleScope, PushRuleKind, PushActionType, RoomTagInfo
+from mautrix.bridge import BaseUser, BridgeState
 from mautrix.util.logging import TraceLogger
 from mautrix.util.opt_prometheus import Gauge
 
@@ -49,6 +50,11 @@ SearchResult = NamedTuple('SearchResult', puppet='pu.Puppet', similarity=int)
 
 METRIC_LOGGED_IN = Gauge('bridge_logged_in', 'Users logged into bridge')
 METRIC_CONNECTED = Gauge('bridge_connected', 'Users connected to Telegram')
+
+BridgeState.human_readable_errors.update({
+    "tg-not-connected": "Your Telegram connection failed",
+    "logged-out": "You're not logged into Telegram",
+})
 
 
 class User(AbstractUser, BaseUser):
@@ -72,8 +78,9 @@ class User(AbstractUser, BaseUser):
                  saved_contacts: int = 0, is_bot: bool = False,
                  db_portals: Optional[Iterable[Tuple[TelegramID, TelegramID]]] = None,
                  db_instance: Optional[DBUser] = None) -> None:
-        super().__init__()
+        AbstractUser.__init__(self)
         self.mxid = mxid
+        BaseUser.__init__(self)
         self.tgid = tgid
         self.is_bot = is_bot
         self.username = username
@@ -85,11 +92,7 @@ class User(AbstractUser, BaseUser):
         self.db_portals = db_portals or []
         self._db_instance = db_instance
         self._ensure_started_lock = asyncio.Lock()
-        self.dm_update_lock = asyncio.Lock()
-        self._metric_value = defaultdict(lambda: False)
         self._track_connection_task = None
-
-        self.command_status = None
 
         (self.relaybot_whitelisted,
          self.whitelisted,
@@ -101,8 +104,6 @@ class User(AbstractUser, BaseUser):
         self.by_mxid[mxid] = self
         if tgid:
             self.by_tgid[tgid] = self
-
-        self.log = self.log.getChild(self.mxid)
 
     @property
     def name(self) -> str:
@@ -217,6 +218,21 @@ class User(AbstractUser, BaseUser):
             connected = bool(self.client._sender._transport_connected
                              if self.client and self.client._sender else False)
             self._track_metric(METRIC_CONNECTED, connected)
+            await self.push_bridge_state(ok=connected, ttl=3600 if connected else 240,
+                                         error="tg-not-connected" if not connected else None)
+
+    async def fill_bridge_state(self, state: BridgeState) -> None:
+        await super().fill_bridge_state(state)
+        state.remote_id = str(self.tgid)
+        state.remote_name = self.human_tg_id
+
+    async def get_bridge_state(self) -> BridgeState:
+        if not self.client:
+            return BridgeState(ok=False, error="logged-out")
+        elif not self.client._sender or not self.client._sender._transport_connected:
+            return BridgeState(ok=False, error="tg-not-connected")
+        else:
+            return BridgeState(ok=True)
 
     async def stop(self) -> None:
         await super().stop()
@@ -224,6 +240,7 @@ class User(AbstractUser, BaseUser):
             self._track_connection_task.cancel()
             self._track_connection_task = None
         self._track_metric(METRIC_CONNECTED, False)
+        await self.push_bridge_state(ok=False, error="tg-not-connected")
 
     async def post_login(self, info: TLUser = None, first_login: bool = False) -> None:
         if config["metrics.enabled"] and not self._track_connection_task:
@@ -328,6 +345,7 @@ class User(AbstractUser, BaseUser):
         self.delete()
         await self.stop()
         self._track_metric(METRIC_LOGGED_IN, False)
+        await self.push_bridge_state(ok=False, error="logged-out")
         return True
 
     def _search_local(self, query: str, max_results: int = 5, min_similarity: int = 45
@@ -376,8 +394,70 @@ class User(AbstractUser, BaseUser):
             if portal.mxid
         }
 
+    async def _tag_room(self, puppet: pu.Puppet, portal: po.Portal, tag: str, active: bool
+                        ) -> None:
+        if not tag or not portal or not portal.mxid:
+            return
+        tag_info = await puppet.intent.get_room_tag(portal.mxid, tag)
+        if active and tag_info is None:
+            tag_info = RoomTagInfo(order=0.5)
+            tag_info[self.bridge.real_user_content_key] = True
+            await puppet.intent.set_room_tag(portal.mxid, tag, tag_info)
+        elif not active and tag_info and tag_info.get(self.bridge.real_user_content_key, False):
+            await puppet.intent.remove_room_tag(portal.mxid, tag)
+
+    @staticmethod
+    async def _mute_room(puppet: pu.Puppet, portal: po.Portal, mute_until: datetime) -> None:
+        if not config["bridge.mute_bridging"] or not portal or not portal.mxid:
+            return
+        now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        if mute_until is not None and mute_until > now:
+            await puppet.intent.set_push_rule(PushRuleScope.GLOBAL, PushRuleKind.ROOM, portal.mxid,
+                                              actions=[PushActionType.DONT_NOTIFY])
+        else:
+            try:
+                await puppet.intent.remove_push_rule(PushRuleScope.GLOBAL, PushRuleKind.ROOM,
+                                                     portal.mxid)
+            except MNotFound:
+                pass
+
+    async def update_folder_peers(self, update: UpdateFolderPeers) -> None:
+        if config["bridge.tag_only_on_create"]:
+            return
+        puppet = await pu.Puppet.get_by_custom_mxid(self.mxid)
+        if not puppet or not puppet.is_real_user:
+            return
+        for peer in update.folder_peers:
+            portal = po.Portal.get_by_entity(peer.peer, receiver_id=self.tgid, create=False)
+            await self._tag_room(puppet, portal, config["bridge.archive_tag"],
+                                 peer.folder_id == 1)
+
+    async def update_pinned_dialogs(self, update: UpdatePinnedDialogs) -> None:
+        if config["bridge.tag_only_on_create"]:
+            return
+        puppet = await pu.Puppet.get_by_custom_mxid(self.mxid)
+        if not puppet or not puppet.is_real_user:
+            return
+        # TODO bridge unpinning properly
+        for pinned in update.order:
+            portal = po.Portal.get_by_entity(pinned.peer, receiver_id=self.tgid, create=False)
+            await self._tag_room(puppet, portal, config["bridge.pinned_tag"], True)
+
+    async def update_notify_settings(self, update: UpdateNotifySettings) -> None:
+        if config["bridge.tag_only_on_create"]:
+            return
+        elif not isinstance(update.peer, NotifyPeer):
+            # TODO handle global notification setting changes?
+            return
+        puppet = await pu.Puppet.get_by_custom_mxid(self.mxid)
+        if not puppet or not puppet.is_real_user:
+            return
+        portal = po.Portal.get_by_entity(update.peer.peer, receiver_id=self.tgid, create=False)
+        await self._mute_room(puppet, portal, update.notify_settings.mute_until)
+
     async def _sync_dialog(self, portal: po.Portal, dialog: Dialog, should_create: bool,
                            puppet: Optional[pu.Puppet]) -> None:
+        was_created = False
         if portal.mxid:
             try:
                 await portal.backfill(self, last_id=dialog.message.id)
@@ -390,6 +470,7 @@ class User(AbstractUser, BaseUser):
         elif should_create:
             try:
                 await portal.create_matrix_room(self, dialog.entity, invites=[self.mxid])
+                was_created = True
             except Exception:
                 self.log.exception(f"Error while creating {portal.tgid_log}")
         if portal.mxid and puppet and puppet.is_real_user:
@@ -403,6 +484,10 @@ class User(AbstractUser, BaseUser):
                                                       dialog.dialog.read_inbox_max_id)
             if last_read:
                 await puppet.intent.mark_read(last_read.mx_room, last_read.mxid)
+            if was_created or not config["bridge.tag_only_on_create"]:
+                await self._mute_room(puppet, portal, dialog.dialog.notify_settings.mute_until)
+                await self._tag_room(puppet, portal, config["bridge.pinned_tag"], dialog.pinned)
+                await self._tag_room(puppet, portal, config["bridge.archive_tag"], dialog.archived)
 
     async def sync_dialogs(self) -> None:
         if self.is_bot:

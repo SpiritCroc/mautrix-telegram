@@ -1,5 +1,5 @@
 # mautrix-telegram - A Matrix-Telegram puppeting bridge
-# Copyright (C) 2020 Tulir Asokan
+# Copyright (C) 2021 Tulir Asokan
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU Affero General Public License as published by
@@ -15,9 +15,9 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 from typing import Tuple, Optional, Union, Dict, Type, Any, TYPE_CHECKING
 from abc import ABC, abstractmethod
+import platform
 import asyncio
 import logging
-import platform
 import time
 
 from telethon.sessions import Session
@@ -31,7 +31,8 @@ from telethon.tl.types import (
     UpdateEditChannelMessage, UpdateEditMessage, UpdateNewChannelMessage, UpdateReadHistoryOutbox,
     UpdateShortChatMessage, UpdateShortMessage, UpdateUserName, UpdateUserPhoto, UpdateUserStatus,
     UpdateUserTyping, User, UserStatusOffline, UserStatusOnline, UpdateReadHistoryInbox,
-    UpdateReadChannelInbox, MessageEmpty)
+    UpdateReadChannelInbox, MessageEmpty, UpdateFolderPeers, UpdatePinnedDialogs,
+    UpdateNotifySettings, UpdateChannelUserTyping)
 
 from mautrix.types import UserID, PresenceState
 from mautrix.errors import MatrixError
@@ -57,6 +58,7 @@ MAX_DELETIONS: int = 10
 UpdateMessage = Union[UpdateShortChatMessage, UpdateShortMessage, UpdateNewChannelMessage,
                       UpdateNewMessage, UpdateEditMessage, UpdateEditChannelMessage]
 UpdateMessageContent = Union[UpdateShortMessage, UpdateShortChatMessage, Message, MessageService]
+UpdateTyping = Union[UpdateUserTyping, UpdateChatUserTyping, UpdateChannelUserTyping]
 
 UPDATE_TIME = Histogram("bridge_telegram_update", "Time spent processing Telegram updates",
                         ("update_type",))
@@ -235,8 +237,7 @@ class AbstractUser(ABC):
     # region Telegram update handling
 
     async def _update(self, update: TypeUpdate) -> None:
-        asyncio.ensure_future(self._handle_entity_updates(getattr(update, "_entities", {})),
-                              loop=self.loop)
+        asyncio.create_task(self._handle_entity_updates(getattr(update, "_entities", {})))
         if isinstance(update, (UpdateShortChatMessage, UpdateShortMessage, UpdateNewChannelMessage,
                                UpdateNewMessage, UpdateEditMessage, UpdateEditChannelMessage)):
             await self.update_message(update)
@@ -244,7 +245,7 @@ class AbstractUser(ABC):
             await self.delete_message(update)
         elif isinstance(update, UpdateDeleteChannelMessages):
             await self.delete_channel_message(update)
-        elif isinstance(update, (UpdateChatUserTyping, UpdateUserTyping)):
+        elif isinstance(update, (UpdateChatUserTyping, UpdateChannelUserTyping, UpdateUserTyping)):
             await self.update_typing(update)
         elif isinstance(update, UpdateUserStatus):
             await self.update_status(update)
@@ -260,8 +261,23 @@ class AbstractUser(ABC):
             await self.update_read_receipt(update)
         elif isinstance(update, (UpdateReadHistoryInbox, UpdateReadChannelInbox)):
             await self.update_own_read_receipt(update)
+        elif isinstance(update, UpdateFolderPeers):
+            await self.update_folder_peers(update)
+        elif isinstance(update, UpdatePinnedDialogs):
+            await self.update_pinned_dialogs(update)
+        elif isinstance(update, UpdateNotifySettings):
+            await self.update_notify_settings(update)
         else:
             self.log.trace("Unhandled update: %s", update)
+
+    async def update_folder_peers(self, update: UpdateFolderPeers) -> None:
+        pass
+
+    async def update_pinned_dialogs(self, update: UpdatePinnedDialogs) -> None:
+        pass
+
+    async def update_notify_settings(self, update: UpdateNotifySettings) -> None:
+        pass
 
     async def update_pinned_messages(self, update: Union[UpdatePinnedMessages,
                                                          UpdatePinnedChannelMessages]) -> None:
@@ -330,16 +346,27 @@ class AbstractUser(ABC):
 
         await portal.set_telegram_admin(TelegramID(update.user_id))
 
-    async def update_typing(self, update: Union[UpdateUserTyping, UpdateChatUserTyping]) -> None:
+    async def update_typing(self, update: UpdateTyping) -> None:
+        sender = None
         if isinstance(update, UpdateUserTyping):
             portal = po.Portal.get_by_tgid(TelegramID(update.user_id), self.tgid, "user")
-        else:
+            sender = pu.Puppet.get(TelegramID(update.user_id))
+        elif isinstance(update, UpdateChannelUserTyping):
+            portal = po.Portal.get_by_tgid(TelegramID(update.channel_id))
+        elif isinstance(update, UpdateChatUserTyping):
             portal = po.Portal.get_by_tgid(TelegramID(update.chat_id))
-
-        if not portal or not portal.mxid:
+        else:
             return
 
-        sender = pu.Puppet.get(TelegramID(update.user_id))
+        if isinstance(update, (UpdateChannelUserTyping, UpdateChatUserTyping)):
+            # Can typing notifications come from non-user peers?
+            if not update.from_id.user_id:
+                return
+            sender = pu.Puppet.get(TelegramID(update.from_id.user_id))
+
+        if not sender or not portal or not portal.mxid:
+            return
+
         await portal.handle_telegram_typing(sender, update)
 
     async def _handle_entity_updates(self, entities: Dict[int, Union[User, Chat, Channel]]
